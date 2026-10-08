@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets
+.env
+.env.*
+
+# Node
+node_modules/
+npm-debug.log*
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large ML models
+*.pth
+*.pt
+*.onnx
+*.bin
+
+# Logs
+*.log
+
+# API keys / secrets
+backend/key.env
+backend/key.env
