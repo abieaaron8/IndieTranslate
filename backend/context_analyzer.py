@@ -37,16 +37,18 @@ class ContextAnalyzer:
         r"\d+(?:,\d+)*(?:\.\d+)?\s*(?:rupees|dollars|rs|inr|crore|lakh)",
     ]
 
-    # URLs and Emails
-    URL_PATTERN = r"https?://[^\s]+"
-    EMAIL_PATTERN = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
-
-    # Known Indian cities / places and standard proper nouns often appearing in code-mixing
     KNOWN_CODE_MIXED_PLACES = {
         "chennai", "mumbai", "delhi", "bengaluru", "bangalore", "hyderabad",
         "kolkata", "pune", "ahmedabad", "jaipur", "kochi", "madurai", "coimbatore",
         "salem", "trichy", "tirunelveli", "noida", "gurugram", "chandigarh"
     }
+
+    # URLs and Emails
+    URL_PATTERN = r"https?://[^\s]+"
+    EMAIL_PATTERN = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+
+    # Known Indian cities / places and standard proper nouns often appearing in code-mixing
+
 
     @classmethod
     def detect_entities(cls, text: str, language_code: str = "ta-IN") -> List[Dict[str, Any]]:

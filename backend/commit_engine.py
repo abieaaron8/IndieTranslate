@@ -139,9 +139,14 @@ class CommitEngine:
         # Final events always force COMMIT for whatever remaining uncommitted text exists
         if is_final_event and uncommitted_text:
             decision = "COMMIT"
-        elif commit_score >= self.COMMIT_THRESHOLD and completeness_info.get("state") == "COMPLETE":
+        elif (
+            (completeness_info.get("state") == "COMPLETE" and stab_score >= 0.40)
+            or (commit_score >= 0.55)
+            or (self.unchanged_partial_count >= 1 and len(uncommitted_text.split()) >= 2 and comp_score >= 0.45)
+            or (len(uncommitted_text.split()) >= 4 and stab_score >= 0.60)
+        ):
             decision = "COMMIT"
-        elif commit_score >= self.PREVIEW_THRESHOLD:
+        elif commit_score >= 0.35 or comp_score >= 0.40:
             decision = "PREVIEW"
         else:
             decision = "WAIT"
