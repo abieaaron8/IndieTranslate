@@ -37,13 +37,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sarvamai.client import AsyncSarvamAI
-from sarvamai.types.realtime_audio_input import RealtimeAudioInput
-from sarvamai.types import RealtimeTranscriptPartial, RealtimeTranscriptFinal
+import numpy as np
+import time
 
 from stability_analyzer import ASRStabilityAnalyzer
 from commit_engine import CommitEngine
 from entity_protector import EntityProtector
 from session_manager import session_manager, ConversationSession, Participant
+from whisper_asr import LocalWhisperASR
+from indictrans2_translator import IndicTrans2Translator
 
 # Load environment variables
 env_path = backend_dir / "key.env"
@@ -53,7 +55,8 @@ else:
     load_dotenv()
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "sarvam").lower()
+TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "indictrans2").lower()
+ASR_BACKEND = os.getenv("ASR_BACKEND", "whisper").lower()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("live-translator")
@@ -91,15 +94,12 @@ async def translate_text(
     preserved_entities = [d["text"] for d in detected]
 
     selected_backend = (backend or TRANSLATION_BACKEND).lower()
-    if selected_backend in ("indictrans2", "local"):
-        from indictrans2_translator import IndicTrans2Translator
+    if selected_backend in ("indictrans2", "local") or not client:
         translator = IndicTrans2Translator.get_instance()
         translated_output = await translator.translate_async(
             protected_text, source_lang, target_lang
         )
     else:
-        if not client:
-            raise ValueError("Sarvam AI client is required when using Sarvam translation backend")
         res = await client.text.translate(
             input=protected_text,
             source_language_code=source_lang,
@@ -132,8 +132,9 @@ class CreateSessionRequest(BaseModel):
 async def health():
     return {
         "status": "ok",
-        "sarvam_configured": bool(SARVAM_API_KEY),
+        "asr_backend": ASR_BACKEND,
         "translation_backend": TRANSLATION_BACKEND,
+        "sarvam_configured": bool(SARVAM_API_KEY),
         "active_sessions": len(session_manager.sessions),
         "local_ip": get_local_ip(),
     }
@@ -145,6 +146,7 @@ async def api_info():
         "local_ip": get_local_ip(),
         "frontend_port": 5173,
         "backend_port": 8000,
+        "asr_backend": ASR_BACKEND,
         "translation_backend": TRANSLATION_BACKEND,
         "sarvam_configured": bool(SARVAM_API_KEY),
     }
@@ -452,6 +454,233 @@ async def run_participant_asr(
         logger.error(f"Fatal error in ASR worker for {participant.participant_id}: {e}", exc_info=True)
 
 
+async def run_participant_local_whisper_asr(
+    participant: Participant,
+    session: ConversationSession,
+):
+    """
+    100% Offline Local ASR & Translation Worker using Faster-Whisper and IndicTrans2.
+    Streams 16kHz PCM chunks, performs energy VAD, generates partial transcripts,
+    runs Stability/Completeness analysis, and commits translations locally.
+    """
+    whisper_asr = LocalWhisperASR.get_instance()
+    logger.info(
+        f"Local Whisper ASR worker started for participant {participant.participant_id} "
+        f"in session {session.session_id}"
+    )
+
+    try:
+        while True:
+            await participant.listening_event.wait()
+            current_lang = participant.language
+            utt_idx = 0
+            audio_buffer = bytearray()
+            last_partial_time = time.time()
+            last_speech_time = time.time()
+            is_speaking = False
+            last_transcribed_text = ""
+
+            logger.info(
+                f"Participant {participant.participant_id} listening with Local Whisper ASR ({current_lang})"
+            )
+
+            while participant.listening_event.is_set() and participant.language == current_lang:
+                try:
+                    raw_pcm = await asyncio.wait_for(
+                        participant.audio_queue.get(), timeout=0.1
+                    )
+                    audio_buffer.extend(raw_pcm)
+
+                    # Compute RMS to detect voice activity
+                    if len(raw_pcm) >= 64:
+                        samples = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
+                        rms = float(np.sqrt(np.mean(samples ** 2)))
+                    else:
+                        rms = 0.0
+
+                    now = time.time()
+                    if rms > 200.0:  # Speech detected
+                        last_speech_time = now
+                        is_speaking = True
+
+                    # Partial transcription trigger: if speaking and >=0.4s audio buffer
+                    if is_speaking and len(audio_buffer) >= 16000 * 2 * 0.4 and (now - last_partial_time >= 0.45):
+                        last_partial_time = now
+                        text, conf = await whisper_asr.transcribe_pcm_async(
+                            bytes(audio_buffer), current_lang
+                        )
+                        clean_text = text.strip()
+                        if clean_text and clean_text != last_transcribed_text:
+                            last_transcribed_text = clean_text
+
+                            stability_info = participant.stability_analyzer.analyze(
+                                text=clean_text, utterance_idx=utt_idx
+                            )
+                            commit_eval = participant.commit_engine.evaluate_partial(
+                                current_text=clean_text,
+                                stability_info=stability_info,
+                                utterance_idx=utt_idx,
+                                is_final_event=False,
+                            )
+                            decision = commit_eval["decision"]
+                            peer = session.get_other_participant(participant.participant_id)
+                            target_lang = peer.language if (peer and peer.language) else ("hi-IN" if current_lang.startswith("ta") else "ta-IN")
+
+                            preview_trans, _ = await translate_text(
+                                None, clean_text, current_lang, target_lang, backend="indictrans2"
+                            )
+
+                            if decision == "COMMIT" and commit_eval.get("segment_to_translate"):
+                                seg = commit_eval["segment_to_translate"]
+                                newly_trans, _ = await translate_text(
+                                    None, seg, current_lang, target_lang, backend="indictrans2"
+                                )
+                                participant.commit_engine.record_commit(seg, newly_trans)
+                                if peer and newly_trans.strip():
+                                    await peer.send_json({
+                                        "type": "translation.commit",
+                                        "speaker_id": participant.participant_id,
+                                        "source_language": current_lang,
+                                        "target_language": target_lang,
+                                        "original": seg,
+                                        "translation": newly_trans.strip(),
+                                        "utterance_index": utt_idx,
+                                        "decision": "COMMIT",
+                                    })
+
+                            # Send partial transcript to SPEAKER
+                            await participant.send_json({
+                                "type": "transcript.partial",
+                                "text": clean_text,
+                                "preview_translation": preview_trans,
+                                "utterance_idx": utt_idx,
+                                "language": current_lang,
+                                "stability": stability_info,
+                                "evidence_gate": {
+                                    "decision": decision,
+                                    "commit_score": commit_eval["commit_score"],
+                                    "stability_score": commit_eval["stability_score"],
+                                    "completeness_score": commit_eval["completeness_score"],
+                                    "completeness_state": commit_eval.get("completeness_state"),
+                                    "completeness_reason": commit_eval.get("completeness_reason"),
+                                    "committed_source": participant.commit_engine.committed_source_text,
+                                    "committed_translation": participant.commit_engine.committed_translation_text,
+                                    "uncommitted_source": commit_eval.get("uncommitted_source", ""),
+                                    "preserved_entities": [],
+                                },
+                            })
+
+                    # Silence / Endpointing: if speaker was speaking and has paused for >=0.75s
+                    if is_speaking and (now - last_speech_time >= 0.75) and len(audio_buffer) >= 16000 * 2 * 0.4:
+                        final_text, _ = await whisper_asr.transcribe_pcm_async(
+                            bytes(audio_buffer), current_lang
+                        )
+                        clean_final = final_text.strip()
+                        if clean_final:
+                            peer = session.get_other_participant(participant.participant_id)
+                            target_lang = peer.language if (peer and peer.language) else ("hi-IN" if current_lang.startswith("ta") else "ta-IN")
+
+                            stability_info = participant.stability_analyzer.analyze(
+                                text=clean_final, utterance_idx=utt_idx
+                            )
+                            commit_eval = participant.commit_engine.evaluate_partial(
+                                current_text=clean_final,
+                                stability_info=stability_info,
+                                utterance_idx=utt_idx,
+                                is_final_event=True,
+                            )
+
+                            translated_final, _ = await translate_text(
+                                None, clean_final, current_lang, target_lang, backend="indictrans2"
+                            )
+
+                            if translated_final.strip() and peer:
+                                await peer.send_json({
+                                    "type": "translation.commit",
+                                    "speaker_id": participant.participant_id,
+                                    "source_language": current_lang,
+                                    "target_language": target_lang,
+                                    "original": clean_final,
+                                    "translation": translated_final.strip(),
+                                    "utterance_index": utt_idx,
+                                    "decision": "COMMIT",
+                                })
+
+                            participant.stability_analyzer.reset(utt_idx + 1)
+                            participant.commit_engine.reset_utterance(utt_idx + 1)
+
+                            await participant.send_json({
+                                "type": "transcript.final",
+                                "text": clean_final,
+                                "translated_text": translated_final,
+                                "source_language": current_lang,
+                                "target_language": target_lang,
+                                "utterance_idx": utt_idx,
+                                "language": current_lang,
+                                "preserved_entities": [],
+                            })
+                            utt_idx += 1
+
+                        audio_buffer.clear()
+                        is_speaking = False
+                        last_transcribed_text = ""
+
+                except asyncio.TimeoutError:
+                    now = time.time()
+                    if is_speaking and (now - last_speech_time >= 0.75) and len(audio_buffer) >= 16000 * 2 * 0.4:
+                        final_text, _ = await whisper_asr.transcribe_pcm_async(
+                            bytes(audio_buffer), current_lang
+                        )
+                        clean_final = final_text.strip()
+                        if clean_final:
+                            peer = session.get_other_participant(participant.participant_id)
+                            target_lang = peer.language if (peer and peer.language) else ("hi-IN" if current_lang.startswith("ta") else "ta-IN")
+
+                            translated_final, _ = await translate_text(
+                                None, clean_final, current_lang, target_lang, backend="indictrans2"
+                            )
+
+                            if translated_final.strip() and peer:
+                                await peer.send_json({
+                                    "type": "translation.commit",
+                                    "speaker_id": participant.participant_id,
+                                    "source_language": current_lang,
+                                    "target_language": target_lang,
+                                    "original": clean_final,
+                                    "translation": translated_final.strip(),
+                                    "utterance_index": utt_idx,
+                                    "decision": "COMMIT",
+                                })
+
+                            participant.stability_analyzer.reset(utt_idx + 1)
+                            participant.commit_engine.reset_utterance(utt_idx + 1)
+
+                            await participant.send_json({
+                                "type": "transcript.final",
+                                "text": clean_final,
+                                "translated_text": translated_final,
+                                "source_language": current_lang,
+                                "target_language": target_lang,
+                                "utterance_idx": utt_idx,
+                                "language": current_lang,
+                                "preserved_entities": [],
+                            })
+                            utt_idx += 1
+
+                        audio_buffer.clear()
+                        is_speaking = False
+                        last_transcribed_text = ""
+                    continue
+                except Exception as ex:
+                    logger.error(f"Local Whisper ASR loop error: {ex}", exc_info=True)
+                    await asyncio.sleep(0.1)
+
+    except asyncio.CancelledError:
+        logger.info(f"Local Whisper ASR worker cancelled for participant {participant.participant_id}")
+    except Exception as e:
+        logger.error(f"Fatal error in Local Whisper ASR worker for {participant.participant_id}: {e}", exc_info=True)
+
+
 # ── Legacy Single-Device Flow Helper (Backward Compatibility) ──────────────────
 async def handle_legacy_single_device(
     websocket: WebSocket,
@@ -628,15 +857,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected to WebSocket")
 
-    if not SARVAM_API_KEY:
-        await websocket.send_json({
-            "type": "error",
-            "message": "SARVAM_API_KEY not configured on backend key.env.",
-        })
-        await websocket.close()
-        return
-
-    sarvam_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
+    sarvam_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY) if SARVAM_API_KEY else None
     session: Optional[ConversationSession] = None
     participant: Optional[Participant] = None
 
@@ -730,9 +951,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
         # Start background independent ASR worker for this participant
-        participant.asr_task = asyncio.create_task(
-            run_participant_asr(participant, session, sarvam_client)
-        )
+        if ASR_BACKEND in ("whisper", "local") or not sarvam_client:
+            participant.asr_task = asyncio.create_task(
+                run_participant_local_whisper_asr(participant, session)
+            )
+        else:
+            participant.asr_task = asyncio.create_task(
+                run_participant_asr(participant, session, sarvam_client)
+            )
 
         # ── Main Event & Audio Loop for this Participant ──
         while True:

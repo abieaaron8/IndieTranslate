@@ -214,8 +214,12 @@ class IndicTrans2Translator:
         if not cleaned:
             return ""
 
-        src_flores = self.normalize_lang_code(source_lang)
-        tgt_flores = self.normalize_lang_code(target_lang)
+        try:
+            src_flores = self.normalize_lang_code(source_lang)
+            tgt_flores = self.normalize_lang_code(target_lang)
+        except Exception as e:
+            logger.warning(f"IndicTrans2 language pair ({source_lang} -> {target_lang}) not supported: {e}. Returning original text.")
+            return cleaned
 
         if src_flores == tgt_flores:
             return cleaned
