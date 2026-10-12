@@ -160,12 +160,15 @@ class IndicTrans2Translator:
         self.model = AutoModelForSeq2SeqLM.from_pretrained(
             str(self.model_path),
             trust_remote_code=True,
-            dtype=self.dtype,
             local_files_only=True,
-        ).to(self.device)
+        )
 
-        self.model.eval()
-        self.ip = IndicProcessor(inference=True)
+        self.model = self.model.to(
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        self.ip = IndicProcessor()
 
         load_sec = round(time.time() - t0, 3)
         logger.info(f"IndicTrans2 model loaded successfully in {load_sec}s on {self.device}")

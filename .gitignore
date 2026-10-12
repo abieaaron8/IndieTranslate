@@ -1,70 +1,37 @@
-# Python & Environments
-.venv/
-.venv*/
-venv/
-env/
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
+*.pyo
 
-# Environment variables, Secrets, Keys
+# Virtual env
+.venv/
+venv/
+env/
+
+# Environment
 .env
 .env.*
-*.env
-key.env
-backend/key.env
-!.env.example
-*.pem
-*.key
-*.cert
 
-# Node / Frontend Build
+# Node
 node_modules/
+
+# Build
 dist/
 build/
-.vite/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 
-# Machine Learning Weights & Large Model Folders
-models/
-*.pt
-*.pth
-*.bin
-*.safetensors
-*.onnx
-*.tflite
-*.h5
-
-# Audio / Media sample recordings
-voice_samples/
-*.wav
-*.mp3
-*.pcm
-*.ogg
-*.flac
-
-# Nested / Extraneous Repositories
-HackNex-translator/
-
-# IDE & Editor files
+# IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*.sublime-project
-*.sublime-workspace
 
-# Operating System files
+# Logs
+*.log
+
+# OS
 .DS_Store
 Thumbs.db
-ehthumbs.db
-[Dd]esktop.ini
 
-# Logs & Temporary files
-*.log
-scratch/
-tmp/
-temp/
+# Model files
+models/
+
+# HuggingFace cache
+.cache/
